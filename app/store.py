@@ -23,6 +23,15 @@ class Store:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audits (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                )
+                """
+            )
             self._conn.commit()
 
     def create(self, public_key_hex: str, package_hex: str, result: dict) -> dict:
@@ -67,5 +76,60 @@ class Store:
                 "created_at": created,
                 "verdict": r.get("verdict"),
                 "payload_sha256": r.get("payload_sha256"),
+            })
+        return out
+
+    # ---------------------------------------------------------------- 审计
+
+    def get_review_row(self, review_id: str):
+        """按编号取出已保存复核记录（结论 + 原始报文 hex）；不存在返回 None。"""
+        cur = self._conn.execute(
+            "SELECT result_json, package_hex FROM reviews WHERE id = ?", (review_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {"result": json.loads(row[0]), "package_hex": row[1]}
+
+    def create_audit(self, result: dict) -> dict:
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            for _ in range(5):
+                aid = uuid.uuid4().hex[:12]
+                try:
+                    self._conn.execute(
+                        "INSERT INTO audits (id, created_at, result_json) VALUES (?, ?, ?)",
+                        (aid, created, json.dumps(result, ensure_ascii=False)),
+                    )
+                    self._conn.commit()
+                    break
+                except sqlite3.IntegrityError:
+                    continue
+            else:
+                raise RuntimeError("无法分配审计编号")
+        return {"id": aid, "created_at": created, **result}
+
+    def get_audit(self, audit_id: str):
+        cur = self._conn.execute(
+            "SELECT id, created_at, result_json FROM audits WHERE id = ?", (audit_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "created_at": row[1], **json.loads(row[2])}
+
+    def list_recent_audits(self, limit: int = 50):
+        cur = self._conn.execute(
+            "SELECT id, created_at, result_json FROM audits ORDER BY rowid DESC LIMIT ?",
+            (limit,),
+        )
+        out = []
+        for aid, created, rj in cur.fetchall():
+            r = json.loads(rj)
+            out.append({
+                "id": aid,
+                "created_at": created,
+                "verdict": r.get("verdict"),
+                "detector_id": r.get("detector_id"),
             })
         return out

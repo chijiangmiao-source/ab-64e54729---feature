@@ -32,10 +32,24 @@
            font-weight: 700; font-size: 13px; }
   .badge.pass { background: #e2f5e9; color: #177245; }
   .badge.fail { background: #fde6e6; color: #b42323; }
+  .badge.feasible { background: #e2f5e9; color: #177245; }
+  .badge.infeasible { background: #fde6e6; color: #b42323; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+  th, td { border: 1px solid #e2e7ec; padding: 6px 8px; text-align: left;
+           vertical-align: top; word-break: break-all; }
+  th { background: #f4f6f8; font-weight: 600; }
+  td.ok { color: #177245; font-weight: 700; }
+  td.no { color: #b42323; font-weight: 700; }
+  tr.culprit td { background: #fdecec; }
+  .src-list { margin: 0; padding-left: 18px; font-size: 13px; }
+  .src-list li { margin: 3px 0; }
   ul.reasons { margin: 0; padding-left: 20px; }
   ul.reasons li { margin: 3px 0; color: #8a1f1f; }
   ul.reasons li.ok { color: #177245; }
   #error { color: #b42323; font-size: 13px; min-height: 18px; margin: 4px 0; }
+  .error-text { color: #b42323; font-size: 13px; min-height: 18px; margin: 4px 0;
+                white-space: pre-line; }
+  .blk { font-size: 14px; margin: 16px 0 4px; }
   .row { display: flex; gap: 10px; align-items: flex-end; }
   .row > div { flex: 1; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
@@ -71,13 +85,56 @@
   </section>
 
   <section>
-    <h2>按编号重新读取</h2>
+    <h2>按编号重新读取复核</h2>
     <div class="row">
       <div>
         <label for="lookup-id">复核编号</label>
         <input type="text" id="lookup-id" class="mono" placeholder="12 位十六进制编号">
       </div>
       <button id="lookup-btn" type="button">读取</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>约束一致性审计</h2>
+    <p class="sub">从同一探测器已验签通过的复核记录中选择若干编号发起审计；约束直接取自被签名的
+       原始载荷，不接受页面提交的约束内容。缺少字段、探测器不一致、重复引用、非法有理数或引用
+       无通过记录的编号将直接拒绝（不生成审计编号）。</p>
+    <label for="audit-ids">来源复核编号（多个用逗号或换行分隔）</label>
+    <textarea id="audit-ids" rows="2" spellcheck="false"
+              placeholder="例如 a1b2c3d4e5f6, 0987654321ab"></textarea>
+    <div id="audit-error" class="error-text"></div>
+    <button id="audit-submit" type="button">发起审计</button>
+  </section>
+
+  <section id="audit-result" hidden>
+    <h2>审计结果</h2>
+    <dl>
+      <dt>审计编号</dt><dd class="mono" id="a-id"></dd>
+      <dt>审计时间</dt><dd id="a-time"></dd>
+      <dt>探测器</dt><dd class="mono" id="a-detector"></dd>
+      <dt>结论</dt><dd><span id="a-verdict" class="badge"></span></dd>
+      <dt>来源</dt><dd><ul id="a-sources" class="src-list"></ul></dd>
+    </dl>
+
+    <h3 class="blk">满足赋值（按参数标识稳定排列）</h3>
+    <div id="a-assignment"></div>
+
+    <h3 class="blk">逐约束复算</h3>
+    <div id="a-checks"></div>
+
+    <h3 class="blk">最少删除的矛盾约束集</h3>
+    <div id="a-contra"></div>
+  </section>
+
+  <section>
+    <h2>按编号读回审计</h2>
+    <div class="row">
+      <div>
+        <label for="audit-lookup-id">审计编号</label>
+        <input type="text" id="audit-lookup-id" class="mono" placeholder="12 位十六进制审计编号">
+      </div>
+      <button id="audit-lookup-btn" type="button">读回</button>
     </div>
   </section>
 </main>
@@ -152,18 +209,189 @@ async function lookup(id) {
   render(await res.json());
 }
 
+// ------------------------------------------------------------ 约束审计
+
+function auditError(msg) { $("audit-error").textContent = msg || ""; }
+
+function constraintText(c) {
+  return c.left + " − " + c.right + " ≤ " + c.bound;
+}
+
+function table(headers, rows) {
+  const t = document.createElement("table");
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  for (const h of headers) {
+    const th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  }
+  thead.appendChild(hr);
+  t.appendChild(thead);
+  const tb = document.createElement("tbody");
+  for (const cells of rows) tb.appendChild(cells);
+  t.appendChild(tb);
+  return t;
+}
+
+function td(text, cls) {
+  const c = document.createElement("td");
+  c.textContent = text;
+  if (cls) c.className = cls;
+  return c;
+}
+
+function renderAudit(rec) {
+  $("audit-result").hidden = false;
+  $("a-id").textContent = rec.id;
+  $("a-time").textContent = rec.created_at;
+  $("a-detector").textContent = rec.detector_id;
+  const v = $("a-verdict");
+  if (rec.verdict === "feasible") {
+    v.textContent = "可同时成立（可行）";
+    v.className = "badge feasible";
+  } else {
+    v.textContent = "不可同时成立（矛盾）";
+    v.className = "badge infeasible";
+  }
+
+  const ul = $("a-sources");
+  ul.innerHTML = "";
+  for (const s of rec.sources || []) {
+    const li = document.createElement("li");
+    li.className = "mono";
+    const digest = (s.payload_sha256 || "").slice(0, 16);
+    li.textContent = `${s.review_id}（载荷 SHA-256 ${digest}…，${s.constraint_count} 条约束）`;
+    ul.appendChild(li);
+  }
+
+  const assignBox = $("a-assignment");
+  assignBox.innerHTML = "";
+  if (rec.verdict === "feasible") {
+    const rows = (rec.assignment || []).map((a) => {
+      const tr = document.createElement("tr");
+      tr.appendChild(td(a.param, "mono"));
+      tr.appendChild(td(a.value, "mono"));
+      return tr;
+    });
+    assignBox.appendChild(table(["参数标识", "赋值（任意精度有理数）"], rows));
+  } else {
+    assignBox.textContent = "（系统存在负环，不存在满足赋值）";
+  }
+
+  const checkBox = $("a-checks");
+  checkBox.innerHTML = "";
+  if (rec.verdict === "feasible") {
+    const rows = (rec.checks || []).map((c) => {
+      const tr = document.createElement("tr");
+      tr.appendChild(td(c.source_review_id, "mono"));
+      tr.appendChild(td(String(c.index), "mono"));
+      tr.appendChild(td(constraintText(c), "mono"));
+      tr.appendChild(td(c.left_minus_right, "mono"));
+      tr.appendChild(td(c.slack, "mono"));
+      tr.appendChild(td(c.holds ? "成立" : "违反", c.holds ? "ok" : "no"));
+      return tr;
+    });
+    checkBox.appendChild(table(
+      ["来源复核", "位置", "约束", "left − right", "松弛", "复算"], rows));
+  } else {
+    checkBox.textContent = "（不可行，不提供复算；删除下列最少矛盾约束后可恢复可行）";
+  }
+
+  const contraBox = $("a-contra");
+  contraBox.innerHTML = "";
+  const mc = rec.minimal_contradictions || [];
+  if (mc.length === 0) {
+    contraBox.textContent = "无——所有签名载荷声明的校准偏差可同时成立。";
+  } else {
+    const intro = document.createElement("p");
+    intro.style.fontSize = "13px";
+    intro.textContent = `最少删除 ${mc.length} 条（精确裁决；同大小时按来源复核编号与数组位置稳定选择）：`;
+    contraBox.appendChild(intro);
+    const rows = mc.map((c) => {
+      const tr = document.createElement("tr");
+      tr.className = "culprit";
+      tr.appendChild(td(c.source_review_id, "mono"));
+      tr.appendChild(td(String(c.index), "mono"));
+      tr.appendChild(td(constraintText(c), "mono"));
+      return tr;
+    });
+    contraBox.appendChild(table(["来源复核编号", "数组位置", "矛盾约束"], rows));
+  }
+  $("audit-result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function submitAudit() {
+  auditError("");
+  const ids = $("audit-ids").value
+    .split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  if (ids.length === 0) { auditError("请至少填写一个来源复核编号"); return; }
+  let res;
+  try {
+    res = await fetch("/api/audits", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ review_ids: ids }),
+    });
+  } catch (e) { auditError("网络错误：" + e); return; }
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const j = await res.json();
+      const d = j.detail;
+      detail = Array.isArray(d?.errors) ? d.errors.join("\n")
+        : (typeof d === "string" ? d : JSON.stringify(d));
+    } catch (_) { detail = "HTTP " + res.status; }
+    auditError("审计被拒绝（未生成审计编号）：\n" + detail);
+    return;
+  }
+  const rec = await res.json();
+  localStorage.setItem("lastAuditId", rec.id);
+  history.replaceState(null, "", "#audit-" + rec.id);
+  $("audit-lookup-id").value = rec.id;
+  renderAudit(rec);
+}
+
+async function lookupAudit(id) {
+  auditError("");
+  let res;
+  try {
+    res = await fetch("/api/audits/" + encodeURIComponent(id));
+  } catch (e) { auditError("网络错误：" + e); return; }
+  if (res.status === 404) { auditError("未找到审计编号：" + id); return; }
+  if (!res.ok) { auditError("读取失败：HTTP " + res.status); return; }
+  renderAudit(await res.json());
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   $("submit").addEventListener("click", submit);
   $("lookup-btn").addEventListener("click", () => {
     const id = $("lookup-id").value.trim();
     if (id) lookup(id);
   });
-  // 刷新后按编号自动重新读取（优先 URL 锚点，其次最近一次提交）
+  $("audit-submit").addEventListener("click", submitAudit);
+  $("audit-lookup-btn").addEventListener("click", () => {
+    const id = $("audit-lookup-id").value.trim();
+    if (id) lookupAudit(id);
+  });
+
+  // 刷新后按锚点读回冻结结果：#audit-xxx 读审计，否则 #xxx / 最近记录读复核
   const fromHash = location.hash.slice(1);
+  if (fromHash.startsWith("audit-")) {
+    const aid = fromHash.slice("audit-".length);
+    $("audit-lookup-id").value = aid;
+    lookupAudit(aid);
+    return;
+  }
   const last = fromHash || localStorage.getItem("lastReviewId");
   if (last) {
     $("lookup-id").value = last;
     lookup(last);
+  }
+  const lastAudit = localStorage.getItem("lastAuditId");
+  if (lastAudit) {
+    $("audit-lookup-id").value = lastAudit;
+    lookupAudit(lastAudit);
   }
 });
 </script>
