@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>辐照校准包 COSE_Sign1 复核</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+         margin: 0; background: #f4f6f8; color: #1c2530; }
+  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 8px 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 12px; }
+  .sub { color: #5b6672; font-size: 13px; margin: 0 0 20px; }
+  section { background: #fff; border: 1px solid #e2e7ec; border-radius: 10px;
+            padding: 18px 20px; margin-bottom: 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 6px; }
+  textarea, input[type=text] { width: 100%; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12.5px; border: 1px solid #c9d2da; border-radius: 6px; padding: 8px 10px;
+      background: #fbfcfd; }
+  textarea:focus, input:focus { outline: 2px solid #2f6fd0; outline-offset: -1px; }
+  button { background: #2f6fd0; color: #fff; border: 0; border-radius: 6px;
+           padding: 9px 22px; font-size: 14px; cursor: pointer; margin-top: 12px; }
+  button:hover { background: #255cb0; }
+  dl { display: grid; grid-template-columns: 130px 1fr; gap: 8px 14px; margin: 0; font-size: 14px; }
+  dt { color: #5b6672; font-weight: 600; }
+  dd, dd { margin: 0; word-break: break-all; }
+  pre { background: #f4f6f8; border: 1px solid #e2e7ec; border-radius: 6px;
+        padding: 10px; margin: 0; font-size: 12.5px; overflow-x: auto; }
+  .badge { display: inline-block; padding: 2px 12px; border-radius: 999px;
+           font-weight: 700; font-size: 13px; }
+  .badge.pass { background: #e2f5e9; color: #177245; }
+  .badge.fail { background: #fde6e6; color: #b42323; }
+  ul.reasons { margin: 0; padding-left: 20px; }
+  ul.reasons li { margin: 3px 0; color: #8a1f1f; }
+  ul.reasons li.ok { color: #177245; }
+  #error { color: #b42323; font-size: 13px; min-height: 18px; margin: 4px 0; }
+  .row { display: flex; gap: 10px; align-items: flex-end; }
+  .row > div { flex: 1; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+</style>
+</head>
+<body>
+<main>
+  <h1>辐照校准包签名复核</h1>
+  <p class="sub">后端对 COSE_Sign1 报文执行严格确定性 CBOR 解析，并以原始受保护头字节与原始载荷构造
+     Sig_structure 完成 Ed25519 验签；拒绝记录与通过记录均持久化，可按编号重新读取。</p>
+
+  <section>
+    <h2>提交复核</h2>
+    <label for="pk">Ed25519 公钥（64 位十六进制）</label>
+    <textarea id="pk" rows="2" spellcheck="false" placeholder="例如 3b6a27bcceb6a42d62a3a8d02a6f0d73..."></textarea>
+    <label for="pkg">COSE_Sign1 报文（十六进制）</label>
+    <textarea id="pkg" rows="8" spellcheck="false" placeholder="8443a10127a058..."></textarea>
+    <div id="error"></div>
+    <button id="submit">提交复核</button>
+  </section>
+
+  <section id="result" hidden>
+    <h2>复核结果</h2>
+    <dl>
+      <dt>复核编号</dt><dd class="mono" id="r-id"></dd>
+      <dt>复核时间</dt><dd id="r-time"></dd>
+      <dt>结论</dt><dd><span id="r-verdict" class="badge"></span></dd>
+      <dt>受保护头</dt><dd><pre id="r-headers"></pre></dd>
+      <dt>载荷 SHA-256</dt><dd class="mono" id="r-digest"></dd>
+      <dt>签名结论</dt><dd id="r-sig"></dd>
+      <dt>逐项拒绝原因</dt><dd><ul id="r-reasons" class="reasons"></ul></dd>
+    </dl>
+  </section>
+
+  <section>
+    <h2>按编号重新读取</h2>
+    <div class="row">
+      <div>
+        <label for="lookup-id">复核编号</label>
+        <input type="text" id="lookup-id" class="mono" placeholder="12 位十六进制编号">
+      </div>
+      <button id="lookup-btn" type="button">读取</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+function error(msg) { $("error").textContent = msg || ""; }
+
+function fmtSig(v) {
+  return v === true ? "有效" : v === false ? "无效" : "未执行";
+}
+
+function render(rec) {
+  $("result").hidden = false;
+  $("r-id").textContent = rec.id;
+  $("r-time").textContent = rec.created_at;
+  const v = $("r-verdict");
+  if (rec.verdict === "pass") { v.textContent = "通过"; v.className = "badge pass"; }
+  else { v.textContent = "拒绝"; v.className = "badge fail"; }
+  $("r-headers").textContent = rec.protected_headers != null
+    ? JSON.stringify(rec.protected_headers, null, 2) : "（无法解析）";
+  $("r-digest").textContent = rec.payload_sha256 || "（无）";
+  $("r-sig").textContent = fmtSig(rec.signature_valid);
+  const ul = $("r-reasons");
+  ul.innerHTML = "";
+  if (!rec.reasons || rec.reasons.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = "无（全部检查通过）";
+    li.className = "ok";
+    ul.appendChild(li);
+  } else {
+    for (const r of rec.reasons) {
+      const li = document.createElement("li");
+      li.textContent = r;
+      ul.appendChild(li);
+    }
+  }
+  $("result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function submit() {
+  error("");
+  const body = {
+    public_key_hex: $("pk").value.trim(),
+    package_hex: $("pkg").value.trim(),
+  };
+  let res;
+  try {
+    res = await fetch("/api/reviews", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) { error("网络错误：" + e); return; }
+  if (!res.ok) { error("提交失败：HTTP " + res.status); return; }
+  const rec = await res.json();
+  localStorage.setItem("lastReviewId", rec.id);
+  history.replaceState(null, "", "#" + rec.id);
+  $("lookup-id").value = rec.id;
+  render(rec);
+}
+
+async function lookup(id) {
+  error("");
+  let res;
+  try {
+    res = await fetch("/api/reviews/" + encodeURIComponent(id));
+  } catch (e) { error("网络错误：" + e); return; }
+  if (res.status === 404) { error("未找到复核编号：" + id); return; }
+  if (!res.ok) { error("读取失败：HTTP " + res.status); return; }
+  render(await res.json());
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  $("submit").addEventListener("click", submit);
+  $("lookup-btn").addEventListener("click", () => {
+    const id = $("lookup-id").value.trim();
+    if (id) lookup(id);
+  });
+  // 刷新后按编号自动重新读取（优先 URL 锚点，其次最近一次提交）
+  const fromHash = location.hash.slice(1);
+  const last = fromHash || localStorage.getItem("lastReviewId");
+  if (last) {
+    $("lookup-id").value = last;
+    lookup(last);
+  }
+});
+</script>
+</body>
+</html>

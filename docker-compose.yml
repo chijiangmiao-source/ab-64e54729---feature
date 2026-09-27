@@ -1,0 +1,29 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      DB_PATH: /data/reviews.db
+    volumes:
+      - reviews-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:8000
+      DB_PATH: /tmp/verify-reviews.db
+    command: ["python", "/srv/verify/verify.py"]
+
+volumes:
+  reviews-data:
