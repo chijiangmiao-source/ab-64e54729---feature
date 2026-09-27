@@ -32,13 +32,23 @@
            font-weight: 700; font-size: 13px; }
   .badge.pass { background: #e2f5e9; color: #177245; }
   .badge.fail { background: #fde6e6; color: #b42323; }
+  .badge.feasible { background: #e2f5e9; color: #177245; }
+  .badge.infeasible { background: #fde6e6; color: #b42323; }
   ul.reasons { margin: 0; padding-left: 20px; }
   ul.reasons li { margin: 3px 0; color: #8a1f1f; }
   ul.reasons li.ok { color: #177245; }
   #error { color: #b42323; font-size: 13px; min-height: 18px; margin: 4px 0; }
+  #aerror { color: #b42323; font-size: 13px; min-height: 18px; margin: 4px 0; }
   .row { display: flex; gap: 10px; align-items: flex-end; }
   .row > div { flex: 1; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; margin-top: 6px; }
+  th, td { border: 1px solid #e2e7ec; padding: 5px 8px; text-align: left; }
+  th { background: #f4f6f8; font-weight: 600; }
+  td.num { font-family: ui-monospace, Consolas, monospace; }
+  .src { color: #5b6672; font-size: 12.5px; margin: 2px 0 8px; }
+  .src span { font-family: ui-monospace, Consolas, monospace; }
+  h3 { font-size: 14px; margin: 14px 0 4px; }
 </style>
 </head>
 <body>
@@ -78,6 +88,69 @@
         <input type="text" id="lookup-id" class="mono" placeholder="12 位十六进制编号">
       </div>
       <button id="lookup-btn" type="button">读取</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>约束一致性审计</h2>
+    <p class="sub" style="margin-bottom:10px">选择同一探测器的若干已通过复核编号（每行一个，或用逗号/空格分隔），
+       服务只使用已保存且验签通过记录中的原始载荷，建立任意精度有理数差分约束图。</p>
+    <label for="audit-ids">来源复核编号（同一 detector_id）</label>
+    <textarea id="audit-ids" rows="3" spellcheck="false" placeholder="a1b2c3d4e5f6&#10;0987654321fe"></textarea>
+    <div id="aerror"></div>
+    <button id="audit-submit" type="button">发起审计</button>
+  </section>
+
+  <section id="audit-result" hidden>
+    <h2>审计结果</h2>
+    <dl>
+      <dt>审计编号</dt><dd class="mono" id="a-id"></dd>
+      <dt>审计时间</dt><dd id="a-time"></dd>
+      <dt>探测器</dt><dd class="mono" id="a-detector"></dd>
+      <dt>来源</dt><dd id="a-sources" class="mono"></dd>
+      <dt>结论</dt><dd><span id="a-status" class="badge"></span></dd>
+    </dl>
+
+    <h3>参与审计的约束（按来源编号、数组位置排列）</h3>
+    <table id="a-constraints"><thead>
+      <tr><th>#</th><th>来源编号</th><th>位置</th><th>左参数</th><th>右参数</th><th>上界</th></tr>
+    </thead><tbody></tbody></table>
+
+    <div id="a-feasible" hidden>
+      <h3>满足赋值（按参数标识稳定排列）</h3>
+      <table id="a-assign"><thead><tr><th>参数</th><th>赋值（有理数）</th></tr></thead><tbody></tbody></table>
+      <h3>逐约束复算</h3>
+      <table id="a-checks"><thead>
+        <tr><th>#</th><th>left − right</th><th>上界</th><th>松弛量</th><th>结论</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+
+    <div id="a-infeasible" hidden>
+      <h3>负环证据</h3>
+      <div id="a-cycle-note" class="src"></div>
+      <table id="a-cycle"><thead>
+        <tr><th>#</th><th>来源编号</th><th>位置</th><th>约束（left − right ≤ bound）</th></tr>
+      </thead><tbody></tbody></table>
+      <h3>最小矛盾集（删除后恢复可行，同尺寸按来源编号、位置稳定选择）</h3>
+      <table id="a-deletions"><thead>
+        <tr><th>#</th><th>来源编号</th><th>位置</th><th>约束</th></tr>
+      </thead><tbody></tbody></table>
+      <h3>删除后的满足赋值与复算</h3>
+      <table id="a-after"><thead>
+        <tr><th>#</th><th>left − right</th><th>上界</th><th>松弛量</th><th>结论</th></tr>
+      </thead><tbody></tbody></table>
+      <table id="a-assign2"><thead><tr><th>参数</th><th>赋值（有理数）</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section>
+    <h2>按审计编号读回冻结结果</h2>
+    <div class="row">
+      <div>
+        <label for="audit-lookup-id">审计编号</label>
+        <input type="text" id="audit-lookup-id" class="mono" placeholder="12 位十六进制编号">
+      </div>
+      <button id="audit-lookup-btn" type="button">读取</button>
     </div>
   </section>
 </main>
@@ -152,14 +225,136 @@ async function lookup(id) {
   render(await res.json());
 }
 
+// ------------------------------------------------------------ 约束审计
+
+function aerror(msg) { $("aerror").textContent = msg || ""; }
+
+function constraintText(c) {
+  return c.left + " − " + c.right + " ≤ " + c.bound;
+}
+
+function fillRows(tbodyId, rows, cells) {
+  const tbody = $(tbodyId).querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    for (const val of cells(row)) {
+      const td = document.createElement("td");
+      td.textContent = val;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function fillAssignment(tableId, assignment) {
+  const tbody = $(tableId).querySelector("tbody");
+  tbody.innerHTML = "";
+  for (const [param, value] of Object.entries(assignment)) {
+    const tr = document.createElement("tr");
+    const td1 = document.createElement("td"); td1.textContent = param;
+    const td2 = document.createElement("td"); td2.textContent = value; td2.className = "num";
+    tr.appendChild(td1); tr.appendChild(td2);
+    tbody.appendChild(tr);
+  }
+}
+
+function checkCells(c) {
+  return [c.index, c.difference, c.bound, c.slack, c.satisfied ? "满足" : "违反"];
+}
+
+function renderAudit(rec) {
+  $("audit-result").hidden = false;
+  $("a-id").textContent = rec.id;
+  $("a-time").textContent = rec.created_at;
+  $("a-detector").textContent = rec.detector_id;
+  $("a-sources").textContent = (rec.source_review_ids || []).join("、");
+  const st = $("a-status");
+  if (rec.status === "feasible") {
+    st.textContent = "可行"; st.className = "badge feasible";
+  } else {
+    st.textContent = "不可行"; st.className = "badge infeasible";
+  }
+
+  fillRows("a-constraints", rec.constraints || [], (c) => [
+    c.index, c.source_id, c.position, c.left, c.right, c.bound,
+  ]);
+
+  $("a-feasible").hidden = rec.status !== "feasible";
+  $("a-infeasible").hidden = rec.status !== "infeasible";
+  if (rec.status === "feasible") {
+    fillAssignment("a-assign", rec.assignment);
+    fillRows("a-checks", rec.checks, checkCells);
+  } else {
+    $("a-cycle-note").textContent = (rec.negative_cycle && rec.negative_cycle.note) || "";
+    fillRows("a-cycle", rec.negative_cycle.constraints, (c) => [
+      c.index, c.source_id, c.position, constraintText(c),
+    ]);
+    const md = rec.minimum_deletions;
+    fillRows("a-deletions", md.constraints, (c) => [
+      c.index, c.source_id, c.position, constraintText(c),
+    ]);
+    fillAssignment("a-assign2", rec.assignment_after_deletions);
+    fillRows("a-after", rec.checks_after_deletions, checkCells);
+  }
+  $("audit-result").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function submitAudit() {
+  aerror("");
+  const ids = $("audit-ids").value.split(/[\s,，、;；]+/).map((s) => s.trim()).filter(Boolean);
+  if (ids.length === 0) { aerror("请填写至少一个来源复核编号"); return; }
+  let res;
+  try {
+    res = await fetch("/api/audits", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ review_ids: ids }),
+    });
+  } catch (e) { aerror("网络错误：" + e); return; }
+  const body = await res.json();
+  if (!res.ok) {
+    aerror("审计被拒绝（未生成审计）：" + (body.detail || ("HTTP " + res.status)));
+    return;
+  }
+  localStorage.setItem("lastAuditId", body.id);
+  history.replaceState(null, "", "#audit=" + body.id);
+  $("audit-lookup-id").value = body.id;
+  renderAudit(body);
+}
+
+async function lookupAudit(id) {
+  aerror("");
+  let res;
+  try {
+    res = await fetch("/api/audits/" + encodeURIComponent(id));
+  } catch (e) { aerror("网络错误：" + e); return; }
+  if (res.status === 404) { aerror("未找到审计编号：" + id); return; }
+  if (!res.ok) { aerror("读取失败：HTTP " + res.status); return; }
+  renderAudit(await res.json());
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   $("submit").addEventListener("click", submit);
   $("lookup-btn").addEventListener("click", () => {
     const id = $("lookup-id").value.trim();
     if (id) lookup(id);
   });
+  $("audit-submit").addEventListener("click", submitAudit);
+  $("audit-lookup-btn").addEventListener("click", () => {
+    const id = $("audit-lookup-id").value.trim();
+    if (id) lookupAudit(id);
+  });
   // 刷新后按编号自动重新读取（优先 URL 锚点，其次最近一次提交）
-  const fromHash = location.hash.slice(1);
+  const hash = location.hash;
+  const auditMatch = hash.match(/^#audit=(.+)$/);
+  if (auditMatch) {
+    const aid = decodeURIComponent(auditMatch[1]);
+    $("audit-lookup-id").value = aid;
+    lookupAudit(aid);
+    return;
+  }
+  const fromHash = hash.slice(1);
   const last = fromHash || localStorage.getItem("lastReviewId");
   if (last) {
     $("lookup-id").value = last;
